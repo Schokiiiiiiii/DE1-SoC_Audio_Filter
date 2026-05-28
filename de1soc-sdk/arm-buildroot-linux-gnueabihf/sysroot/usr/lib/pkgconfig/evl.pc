@@ -1,0 +1,10 @@
+prefix=/usr
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: evl
+Description: API library and utilities for EVL
+Version: 0.48
+Libs: -L${libdir} -levl
+Libs.private: -pthread
+Cflags: -I${includedir}

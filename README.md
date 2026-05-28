@@ -16,3 +16,7 @@ An interface, such as a CLI, buttons, or another control method, must allow the 
 The latency introduced by the processing must be measured and analyzed, especially under overload conditions. It is important to ensure that the system can handle processing deadlines while maintaining acceptable audio quality, even when the resources are under maximum load.
 
 For this project, it is recommended to use a signal generator to generate the input signal and an oscilloscope to visualize the output signal.
+
+## REDS Driver
+
+https://reds-gitlab.heig-vd.ch/reds-public/evl-rt/-/blob/main/linux/linux/reds/de1_audio/de1_audio.c?ref_type=heads

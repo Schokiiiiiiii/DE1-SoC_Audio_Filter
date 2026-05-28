@@ -1,0 +1,11 @@
+prefix=/home/schoki/Documents/HEIG-VD/Semestre4/PTR/de1soc-sdk
+exec_prefix=/home/schoki/Documents/HEIG-VD/Semestre4/PTR/de1soc-sdk
+libdir=/home/schoki/Documents/HEIG-VD/Semestre4/PTR/de1soc-sdk/lib
+includedir=/home/schoki/Documents/HEIG-VD/Semestre4/PTR/de1soc-sdk/include
+
+Name: fdisk
+Description: fdisk library
+Version: 2.37.4
+Requires.private: uuid blkid
+Cflags: -I${includedir}/libfdisk
+Libs: -L${libdir} -lfdisk
