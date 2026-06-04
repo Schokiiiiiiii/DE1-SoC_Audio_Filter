@@ -13,18 +13,20 @@
 #include <string.h>
 #include <time.h>
 #include <sched.h>
+#include <stdatomic.h>
 
 #include <evl/evl.h>
 #include <evl/thread.h>
 #include <evl/timer.h>
 #include <evl/clock.h>
 
-#include "../de1soc.h"
+#include "de1soc_io.h"
 
-// In case it's not defined from de1soc.h
-#ifndef AUDIO_FILE
+// Bit macro
+#define BIT(n) (1U << (n))
+
+// Path to audio driver
 #define AUDIO_FILE "/dev/snd"
-#endif
 
 // General audio parameters
 #define AUDIO_SAMPLE_RATE_HZ  48000
@@ -48,11 +50,27 @@
  */
 #define AUDIO_PERIOD_NS     1333333L
 
+// Other defines
+#define NB_THREADS  2
+#define KEY0_BIT    BIT(0)
+#define KEY1_BIT    BIT(1)
+#define KEY2_BIT    BIT(2)
+#define KEY3_BIT    BIT(3)
+#define BUTTON_SLEEP_TIME 50000 // 50'000us = 50ms
+
 // Stopping Condition
 static volatile sig_atomic_t running = 1;
 
 // Audio file descriptor
 static int audio_fd = -1;
+
+static const int mode_size = 4;
+enum Mode {
+    NORMAL,
+    AMPLITUDE,
+    LOW_PASS,
+    HIGH_PASS
+} mode = NORMAL;
 
 /**
  * @brief Stops running after receiving SIGINT
@@ -246,9 +264,49 @@ static void *copy_audio(void *arg __attribute__((unused)))
     return NULL;
 }
 
+static void *wait_button(void *arg __attribute__((unused)))
+{
+    uint32_t previous_keys = 0;
+    uint32_t keys;
+    enum Mode new_mode;
+
+    // Initialize the de1soc io file descriptor
+    init_de1soc_io();
+
+    while (running) {
+
+        // Read keys and mode
+        keys = read_key();
+        new_mode = atomic_load(&mode);
+
+        if (keys != previous_keys && keys == (uint32_t) KEY0_BIT) { // Move right (up)
+            new_mode = (new_mode + 1) % mode_size;
+            atomic_store(&mode, new_mode);
+            printf("New mode : %d\n", new_mode);
+            fflush(stdout);
+        } else if (keys != previous_keys && keys == (uint32_t) KEY1_BIT) { // Move left (down)
+            new_mode = (new_mode - 1 + mode_size) % mode_size;
+            atomic_store(&mode, new_mode);
+            printf("New mode : %d\n", new_mode);
+            fflush(stdout);
+        }
+
+        // Remember keys for future test
+        previous_keys = keys;
+
+        // Can sleep for some time since not needed to always run
+        usleep(BUTTON_SLEEP_TIME);
+    }
+
+    // Clear file descriptor for io
+    clear_de1soc_io();
+
+    return NULL;
+}
+
 int main(void)
 {
-    pthread_t thread;
+    pthread_t thread[NB_THREADS];
     int ret;
 
     // Link SIGINT to stop program
@@ -271,18 +329,27 @@ int main(void)
         return ret;
     }
 
+    // Create button thread
+    ret = pthread_create(&thread[0], NULL, wait_button, NULL);
+    if (ret != 0) {
+        fprintf(stderr, "Error creating button thread\n");
+        goto clear_audio;
+    }
+
     // Create EVL thread
-    ret = pthread_create(&thread, NULL, copy_audio, NULL);
+    ret = pthread_create(&thread[1], NULL, copy_audio, NULL);
     if (ret != 0) {
         fprintf(stderr, "Error creating audio thread\n");
         goto clear_audio;
     }
 
-    // Wait for thread
-    ret = pthread_join(thread, NULL);
-    if (ret != 0) {
-        fprintf(stderr, "Error joining audio thread\n");
-        goto clear_audio;
+    // Wait for threads
+    for (int i = 0 ; i < NB_THREADS ; ++i) {
+        ret = pthread_join(thread[i], NULL);
+        if (ret != 0) {
+            fprintf(stderr, "Error joining audio thread\n");
+            goto clear_audio;
+        }
     }
 
     // Close audio_fd
