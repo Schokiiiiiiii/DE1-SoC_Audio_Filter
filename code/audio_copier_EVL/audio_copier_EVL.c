@@ -1,8 +1,21 @@
+/************************************************************
+ * @file    audio_copier_EVL.c
+ * @version 1.0
+ * @date    04.06.2026
+ * @author  Fabien Léger & Arnaut Leyre
+ * @brief   Audio filtering for DE1-SoC using EVL
+ ************************************************************/
+
 #define _GNU_SOURCE
+
+/**************************
+ * INCLUDES
+ **************************/
 
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -22,15 +35,22 @@
 
 #include "de1soc_io.h"
 
+/************************************************************
+ * DEFINES
+ ************************************************************/
+
 // Bit macro
 #define BIT(n) (1U << (n))
+
+// Main defines
+#define NB_THREADS  3
 
 // Path to audio driver
 #define AUDIO_FILE "/dev/snd"
 
 // General audio parameters
 #define AUDIO_SAMPLE_RATE_HZ  48000
-#define AUDIO_FRAMES             64 // we take 64 because with 128 the last doesn't write itself
+#define AUDIO_FRAMES             64 // Smaller block than FIFO size to reduce partial writes
 #define AUDIO_CHANNELS            2
 
 /*
@@ -50,37 +70,66 @@
  */
 #define AUDIO_PERIOD_NS     1333333L
 
-// Other defines
-#define NB_THREADS  3
+// Buttons
 #define KEY0_BIT    BIT(0)
 #define KEY1_BIT    BIT(1)
 #define KEY2_BIT    BIT(2)
 #define KEY3_BIT    BIT(3)
 #define BUTTON_SLEEP_TIME 50000 // 50'000us = 50ms
 
+// Filter parameters
+#define GAIN        0.5f
+#define LP_ALPHA    0.05f
+#define HP_BETA     0.95f
+
 // Watchdog parameters
 #define WATCHDOG_MARGIN_NS  700000L
 #define WATCHDOG_TIMEOUT_NS (AUDIO_PERIOD_NS + WATCHDOG_MARGIN_NS)
 #define AUDIO_DONE_FLAG     BIT(0)
 
+/************************************************************
+ * TYPES AND GLOBALS
+ ************************************************************/
+
 // Stopping Condition
-static volatile sig_atomic_t running = 1;
+static atomic_bool running = true;
 
 // Audio file descriptor
 static int audio_fd = -1;
+
+// Structure for filtering
+typedef struct {
+    float lp_prev_y_left;
+    float lp_prev_y_right;
+
+    float hp_prev_x_left;
+    float hp_prev_x_right;
+    float hp_prev_y_left;
+    float hp_prev_y_right;
+} filter_state_t;
+
+static filter_state_t filter_state = {0};
 
 // Watchdog flags
 static struct evl_flags watchdog_flags;
 static int watchdog_flags_fd = -1;
 
-static const int mode_size = 4;
+// Watchdog overload count
+static atomic_uint overload_count = 0;
+
+// Modes for filtering
 enum Mode {
     NORMAL,
     AMPLITUDE,
     LOW_PASS,
-    HIGH_PASS
+    HIGH_PASS,
+    MODE_COUNT // number of modes
 };
 static _Atomic enum Mode mode = NORMAL;
+
+/************************************************************
+ * INTERRUPTS
+ ************************************************************/
 
 /**
  * @brief Stops running after receiving SIGINT
@@ -88,8 +137,12 @@ static _Atomic enum Mode mode = NORMAL;
  */
 static void sigint_handler(int signum __attribute__((unused)))
 {
-    running = 0;
+    atomic_store(&running, false);
 }
+
+/************************************************************
+ * AUDIO HELPERS
+ ************************************************************/
 
 /**
  * @brief Initializes audio_fd by opening audio file
@@ -125,6 +178,10 @@ static void clear_audio(void)
         audio_fd = -1;
     }
 }
+
+/************************************************************
+ * WATCHDOG
+ ************************************************************/
     
 /**
  * @brief Close watchdog flags
@@ -136,41 +193,6 @@ static void clear_watchdog(void)
         close(watchdog_flags_fd);
         watchdog_flags_fd = -1;
     }
-}
-
-/**
- * @brief Transforms audio depending on filter
- * @param buffer Buffer of samples
- * @param samples Size of the buffer
- */
-static void process_audio(uint16_t *buffer, size_t samples)
-{
-    /*
-     * For now, this is a simple copy/bypass.
-     *
-     * Buffer format:
-     * buffer[0] = Left0
-     * buffer[1] = Right0
-     * buffer[2] = Left1
-     * buffer[3] = Right1
-     * ...
-     */
-
-    for (size_t i = 0; i < samples; i++) {
-        buffer[i] = buffer[i];
-    }
-}
-
-/**
- * @brief Handles overload detection
- */
-static void handle_overload(void)
-{
-    /*
-     * For now, nothing is done here.
-     * Later, this function can reduce filter complexity,
-     * switch to bypass mode, or notify the user.
-     */
 }
 
 /**
@@ -194,6 +216,16 @@ static void timespec_add_ns(struct timespec *r, const struct timespec *t, long l
         r->tv_sec++;
         r->tv_nsec -= 1000000000L;
     }
+}
+
+
+/**
+ * @brief Handles overload detection
+ */
+static void handle_overload(void)
+{
+    atomic_fetch_add(&overload_count, 1);
+    atomic_store(&mode, NORMAL);
 }
 
 /**
@@ -231,7 +263,7 @@ static void *watchdog_audio(void *arg __attribute__((unused)))
     evl_printf("Watchdog EVL thread started\n");
 
     // Run until stopped
-    while (running) {
+    while (atomic_load(&running)) {
 
         // Read current time
         ret = evl_read_clock(EVL_CLOCK_MONOTONIC, &now);
@@ -245,7 +277,6 @@ static void *watchdog_audio(void *arg __attribute__((unused)))
 
         // Wait for audio thread end of cycle
         ret = evl_timedwait_exact_flags(&watchdog_flags, AUDIO_DONE_FLAG, &timeout);
-
         if (ret == 0) {
             continue;
         }
@@ -268,6 +299,105 @@ static void *watchdog_audio(void *arg __attribute__((unused)))
 
     return NULL;
 }
+
+/************************************************************
+ * FILTERS
+ ************************************************************/
+
+static int16_t clamp_i16(float value)
+{
+    if (value > INT16_MAX) {
+        return INT16_MAX;
+    }
+
+    if (value < INT16_MIN) {
+        return INT16_MIN;
+    }
+
+    return (int16_t)value;
+}
+
+static int16_t process_amplitude(int16_t x)
+{
+    return clamp_i16(GAIN * x);
+}
+
+static int16_t process_low_pass(int16_t x, float *prev_y)
+{
+    float y;
+
+    y = LP_ALPHA * x + (1.0f - LP_ALPHA) * (*prev_y);
+    *prev_y = y;
+
+    return clamp_i16(y);
+}
+
+static int16_t process_high_pass(int16_t x, float *prev_x, float *prev_y)
+{
+    float y;
+
+    y = HP_BETA * ((*prev_y) + x - (*prev_x));
+
+    *prev_x = x;
+    *prev_y = y;
+
+    return clamp_i16(y);
+}
+
+/**
+ * @brief Transforms audio depending on filter
+ * @param buffer Buffer of samples
+ * @param samples Size of the buffer
+ */
+static void process_audio(uint16_t *buffer, size_t samples)
+{
+    // Retrieve current mode
+    int current_mode = atomic_load(&mode);
+
+    // Loop over all the samples with a step of 2
+    for (size_t i = 0; i + 1 < samples; i += 2) {
+        // Retrieve left and right samples
+        int16_t left = (int16_t)buffer[i];
+        int16_t right = (int16_t)buffer[i + 1];
+
+        // Modify depending on mode
+        switch (current_mode) {
+        case NORMAL:
+            return;
+
+        case AMPLITUDE:
+            left = process_amplitude(left);
+            right = process_amplitude(right);
+            break;
+
+        case LOW_PASS:
+            left = process_low_pass(left, &filter_state.lp_prev_y_left);
+            right = process_low_pass(right, &filter_state.lp_prev_y_right);
+            break;
+
+        case HIGH_PASS:
+            left = process_high_pass(left,
+                                     &filter_state.hp_prev_x_left,
+                                     &filter_state.hp_prev_y_left);
+
+            right = process_high_pass(right,
+                                      &filter_state.hp_prev_x_right,
+                                      &filter_state.hp_prev_y_right);
+            break;
+
+        default:
+            break;
+        }
+
+        // Write back the samples
+        buffer[i] = (uint16_t)left;
+        buffer[i + 1] = (uint16_t)right;
+    }
+}
+
+/************************************************************
+ * EVL THREAD COPIER
+ ************************************************************/
 
 /**
  * Copies audio from FIFO-in to FIFO-out while processing the audio
@@ -331,7 +461,7 @@ static void *copy_audio(void *arg __attribute__((unused)))
     evl_printf("Audio EVL thread started\n");
 
     // Run until stopped
-    while (running) {
+    while (atomic_load(&running)) {
         ssize_t bytes_read;
         ssize_t bytes_written;
         size_t samples_read;
@@ -398,6 +528,10 @@ static void *copy_audio(void *arg __attribute__((unused)))
     return NULL;
 }
 
+/************************************************************
+ * BUTTON UI
+ ************************************************************/
+
 static void *wait_button(void *arg __attribute__((unused)))
 {
     uint32_t previous_keys = 0;
@@ -407,22 +541,18 @@ static void *wait_button(void *arg __attribute__((unused)))
     // Initialize the de1soc io file descriptor
     init_de1soc_io();
 
-    while (running) {
+    while (atomic_load(&running)) {
 
         // Read keys and mode
         keys = read_key();
         new_mode = atomic_load(&mode);
 
         if (keys != previous_keys && keys == (uint32_t) KEY0_BIT) { // Move right (up)
-            new_mode = (new_mode + 1) % mode_size;
+            new_mode = (new_mode + 1) % MODE_COUNT;
             atomic_store(&mode, new_mode);
-            printf("New mode : %d\n", new_mode);
-            fflush(stdout);
         } else if (keys != previous_keys && keys == (uint32_t) KEY1_BIT) { // Move left (down)
-            new_mode = (new_mode - 1 + mode_size) % mode_size;
+            new_mode = (new_mode - 1 + MODE_COUNT) % MODE_COUNT;
             atomic_store(&mode, new_mode);
-            printf("New mode : %d\n", new_mode);
-            fflush(stdout);
         }
 
         // Remember keys for future test
@@ -437,6 +567,10 @@ static void *wait_button(void *arg __attribute__((unused)))
 
     return NULL;
 }
+
+/************************************************************
+ * MAIN
+ ************************************************************/
 
 int main(void)
 {
