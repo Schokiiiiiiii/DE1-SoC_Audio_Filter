@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -11,6 +12,13 @@
 #include <errno.h>
 #include <string.h>
 #include <time.h>
+#include <sched.h>
+
+#include <evl/evl.h>
+#include <evl/thread.h>
+#include <evl/timer.h>
+#include <evl/clock.h>
+#include <evl/proxy.h>
 
 #include "de1soc.h"
 
@@ -30,6 +38,8 @@
 #define FIFO_RD_RIGHT(fifo)     (((fifo) >> AUD_CORE_RD_RIGHT_BITS) & 0xFF)
 #define FIFO_WR_LEFT(fifo)      (((fifo) >> AUD_CORE_WR_LEFT_BITS) & 0xFF)
 #define FIFO_WR_RIGHT(fifo)     (((fifo) >> AUD_CORE_WR_RIGHT_BITS) & 0xFF)
+
+#define AUDIO_POLL_NS 10000L
 
 static volatile sig_atomic_t running = 1;
 
@@ -119,25 +129,61 @@ static void clear_audio(void)
 
 static void *copy_audio(void *arg __attribute__((unused)))
 {
-    unsigned debug_counter = 0;
+    int ret;
+    int evl_fd;
+    int timer_fd;
+    cpu_set_t cpuset;
+    struct itimerspec timer;
+    __u64 ticks;
+    
+    //  Run the EVL task on CPU 1
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset);
+    ret = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (ret != 0) {
+        fprintf(stderr, "pthread_setaffinity_np() failed: %s\n", strerror(ret));
+        return NULL;
+    }
 
-    printf("Audio thread started\n");
-    printf("Copying input to output using mmap on %s\n", AUDIO_FILE);
-    fflush(stdout);
+    // Make thread an evl thread
+    evl_fd = evl_attach_self("copy_audio");
+    if (evl_fd < 0) {
+        fprintf(stderr, "evl_attach_self() failed\n");
+        return NULL;
+    }
+
+    // Create timer
+    timer_fd = evl_new_timer(EVL_CLOCK_MONOTONIC);
+    if (timer_fd < 0) {
+        evl_printf("evl_new_timer() failed\n");
+        close(evl_fd);
+        return NULL;
+    }
+
+    memset(&timer, 0, sizeof(timer));
+    timer.it_value.tv_sec = 0;
+    timer.it_value.tv_nsec = AUDIO_POLL_NS;
+    timer.it_interval.tv_sec = 0;
+    timer.it_interval.tv_nsec = AUDIO_POLL_NS;
+
+    ret = evl_set_timer(timer_fd, &timer, NULL);
+    if (ret != 0) {
+        evl_printf("evl_set_timer() failed\n");
+        close(timer_fd);
+        close(evl_fd);
+        return NULL;
+    }
+
+    evl_printf("Audio thread started\n");
 
     while (running) {
-        uint32_t fifo = audio_read32(AUD_CORE_FIFO);
-
-        if (++debug_counter >= 50000) {
-            printf("FIFO: RD_L=%u RD_R=%u WR_L=%u WR_R=%u raw=0x%08x\n",
-                   FIFO_RD_LEFT(fifo),
-                   FIFO_RD_RIGHT(fifo),
-                   FIFO_WR_LEFT(fifo),
-                   FIFO_WR_RIGHT(fifo),
-                   fifo);
-            fflush(stdout);
-            debug_counter = 0;
+        ret = oob_read(timer_fd, &ticks, sizeof(ticks));
+        if (ret < 0) {
+            evl_printf("oob_read() failed\n");
+            break;
         }
+
+        uint32_t fifo = audio_read32(AUD_CORE_FIFO);
 
         /*
          * Need:
@@ -158,15 +204,14 @@ static void *copy_audio(void *arg __attribute__((unused)))
 
             audio_write32(AUD_CORE_LEFT, left_sample);
             audio_write32(AUD_CORE_RIGHT, right_sample);
-        } else {
-            struct timespec delay = {
-                .tv_sec = 0,
-                .tv_nsec = 10000
-            };
-
-            nanosleep(&delay, NULL);
         }
     }
+
+    memset(&timer, 0, sizeof(timer));
+    evl_set_timer(timer_fd, &timer, NULL);
+
+    close(timer_fd);
+    close(evl_fd);
 
     return NULL;
 }
@@ -177,19 +222,24 @@ int main(void)
 
     signal(SIGINT, sigint_handler);
 
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        fprintf(stderr, "mlockall() failed: %s\n", strerror(errno));
+        return EXIT_FAILURE;
+    }
+
     printf("Opening audio copier\n");
     printf("Device: %s\n", AUDIO_FILE);
     printf("Press Ctrl+C to stop\n");
     fflush(stdout);
 
     if (init_audio() < 0) {
-        return 1;
+        return EXIT_FAILURE;
     }
 
     if (pthread_create(&thread, NULL, copy_audio, NULL) != 0) {
         fprintf(stderr, "Error creating audio thread\n");
         clear_audio();
-        return 1;
+        return EXIT_FAILURE;
     }
 
     pthread_join(thread, NULL);
@@ -197,5 +247,5 @@ int main(void)
     clear_audio();
 
     printf("\nGoodbye!\n");
-    return 0;
+    return EXIT_SUCCESS;
 }
