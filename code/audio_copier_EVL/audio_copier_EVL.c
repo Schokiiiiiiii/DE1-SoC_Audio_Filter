@@ -79,8 +79,8 @@
 
 // Filter parameters
 #define GAIN        0.5f
-#define LP_ALPHA    0.05f
-#define HP_BETA     0.95f
+#define FIR64_TAPS 64
+#define FIR16_TAPS 16
 
 // Watchdog parameters
 #define WATCHDOG_MARGIN_NS  700000L
@@ -99,16 +99,12 @@ static int audio_fd = -1;
 
 // Structure for filtering
 typedef struct {
-    float lp_prev_y_left;
-    float lp_prev_y_right;
+    float left[FIR64_TAPS];
+    float right[FIR64_TAPS];
+    size_t index;
+} fir_state_t;
 
-    float hp_prev_x_left;
-    float hp_prev_x_right;
-    float hp_prev_y_left;
-    float hp_prev_y_right;
-} filter_state_t;
-
-static filter_state_t filter_state = {0};
+static fir_state_t fir_state = {0};
 
 // Watchdog flags
 static struct evl_flags watchdog_flags;
@@ -121,11 +117,19 @@ static atomic_uint overload_count = 0;
 enum Mode {
     NORMAL,
     AMPLITUDE,
-    LOW_PASS,
-    HIGH_PASS,
-    MODE_COUNT // number of modes
+    FIR_64,
+    FIR_16,
+    MODE_COUNT // Number of modes
 };
 static _Atomic enum Mode mode = NORMAL;
+
+static const float fir64_coeffs[FIR64_TAPS] = {
+    [0 ... FIR64_TAPS - 1] = 1.0f / FIR64_TAPS
+};
+
+static const float fir16_coeffs[FIR16_TAPS] = {
+    [0 ... FIR16_TAPS - 1] = 1.0f / FIR16_TAPS
+};
 
 /************************************************************
  * INTERRUPTS
@@ -224,8 +228,17 @@ static void timespec_add_ns(struct timespec *r, const struct timespec *t, long l
  */
 static void handle_overload(void)
 {
+    enum Mode current_mode;
+
     atomic_fetch_add(&overload_count, 1);
-    atomic_store(&mode, NORMAL);
+
+    current_mode = atomic_load(&mode);
+
+    if (current_mode == FIR_64) {
+        atomic_store(&mode, FIR_16);
+    } else if (current_mode != FIR_16) { // FIR_16 keeps loopins
+        atomic_store(&mode, NORMAL);
+    }
 }
 
 /**
@@ -317,31 +330,59 @@ static int16_t clamp_i16(float value)
     return (int16_t)value;
 }
 
+static int16_t process_fir_sample(float *history,
+                                  size_t index,
+                                  int16_t x,
+                                  const float *coeffs,
+                                  size_t taps)
+{
+    float y = 0.0f;
+    size_t hist_index;
+
+    history[index] = (float)x;
+    hist_index = index;
+
+    for (size_t k = 0; k < taps; k++) {
+        y += coeffs[k] * history[hist_index];
+
+        if (hist_index == 0) {
+            hist_index = FIR64_TAPS - 1;
+        } else {
+            hist_index--;
+        }
+    }
+
+    return clamp_i16(y);
+}
+
+static void process_fir_stereo(int16_t *left, int16_t *right, size_t taps)
+{
+    const float *coeffs;
+
+    if (taps == FIR64_TAPS) {
+        coeffs = fir64_coeffs;
+    } else {
+        coeffs = fir16_coeffs;
+    }
+
+    *left = process_fir_sample(fir_state.left,
+                               fir_state.index,
+                               *left,
+                               coeffs,
+                               taps);
+
+    *right = process_fir_sample(fir_state.right,
+                                fir_state.index,
+                                *right,
+                                coeffs,
+                                taps);
+
+    fir_state.index = (fir_state.index + 1) % FIR64_TAPS;
+}
+
 static int16_t process_amplitude(int16_t x)
 {
     return clamp_i16(GAIN * x);
-}
-
-static int16_t process_low_pass(int16_t x, float *prev_y)
-{
-    float y;
-
-    y = LP_ALPHA * x + (1.0f - LP_ALPHA) * (*prev_y);
-    *prev_y = y;
-
-    return clamp_i16(y);
-}
-
-static int16_t process_high_pass(int16_t x, float *prev_x, float *prev_y)
-{
-    float y;
-
-    y = HP_BETA * ((*prev_y) + x - (*prev_x));
-
-    *prev_x = x;
-    *prev_y = y;
-
-    return clamp_i16(y);
 }
 
 /**
@@ -370,19 +411,12 @@ static void process_audio(uint16_t *buffer, size_t samples)
             right = process_amplitude(right);
             break;
 
-        case LOW_PASS:
-            left = process_low_pass(left, &filter_state.lp_prev_y_left);
-            right = process_low_pass(right, &filter_state.lp_prev_y_right);
+        case FIR_64:
+            process_fir_stereo(&left, &right, FIR64_TAPS);
             break;
 
-        case HIGH_PASS:
-            left = process_high_pass(left,
-                                     &filter_state.hp_prev_x_left,
-                                     &filter_state.hp_prev_y_left);
-
-            right = process_high_pass(right,
-                                      &filter_state.hp_prev_x_right,
-                                      &filter_state.hp_prev_y_right);
+        case FIR_16:
+            process_fir_stereo(&left, &right, FIR16_TAPS);
             break;
 
         default:
