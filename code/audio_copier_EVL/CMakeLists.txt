@@ -2,14 +2,8 @@ cmake_minimum_required(VERSION 3.28)
 
 project(AudioCopierEVL C)
 
-add_executable(audio_copier_EVL
-        audio_copier_EVL.c
-)
+add_executable(audio_copier_EVL audio_copier_EVL.c)
 
-target_include_directories(audio_copier_EVL PRIVATE
-        ../../
-)
+target_include_directories(audio_copier_EVL PRIVATE ../)
 
-target_link_libraries(audio_copier_EVL PRIVATE
-        pthread
-)
+target_link_libraries(audio_copier_EVL PRIVATE evl pthread)

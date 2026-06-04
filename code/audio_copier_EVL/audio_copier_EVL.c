@@ -20,7 +20,7 @@
 #include <evl/clock.h>
 #include <evl/proxy.h>
 
-#include "../de1soc.h"
+#include "de1soc.h"
 
 #define AUD_CTRLS_SIZE  0xB0
 
