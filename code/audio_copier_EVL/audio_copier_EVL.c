@@ -463,6 +463,13 @@ int main(void)
         return ret;
     }
 
+    // Initialize EVL library
+    ret = evl_init();
+    if (ret != 0) {
+        fprintf(stderr, "evl_init() failed\n");
+        goto clear_audio;
+    }
+
     // Create watchdog flags
     watchdog_flags_fd = evl_new_flags(&watchdog_flags, "audio_watchdog_flags");
     if (watchdog_flags_fd < 0) {
