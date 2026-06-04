@@ -28,7 +28,7 @@
 
 // General audio parameters
 #define AUDIO_SAMPLE_RATE_HZ  48000
-#define AUDIO_FRAMES            128
+#define AUDIO_FRAMES             64 // we take 64 because with 128 the last doesn't write itself
 #define AUDIO_CHANNELS            2
 
 /*
@@ -43,10 +43,10 @@
 #define AUDIO_BUFFER_BYTES  (AUDIO_SAMPLES * sizeof(uint16_t))
 
 /*
- * Time for 128 stereo frames at 48 kHz:
- * 128 / 48000 = 2.666 ms
+ * Time for 64 stereo frames at 48 kHz:
+ * 64 / 48000 = 2.666 ms
  */
-#define AUDIO_PERIOD_NS     2666667L
+#define AUDIO_PERIOD_NS     1333333L
 
 // Stopping Condition
 static volatile sig_atomic_t running = 1;
