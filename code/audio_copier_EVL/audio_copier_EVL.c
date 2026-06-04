@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <signal.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -19,6 +18,7 @@
 #include <evl/thread.h>
 #include <evl/timer.h>
 #include <evl/clock.h>
+#include <evl/flags.h>
 
 #include "de1soc_io.h"
 
@@ -46,17 +46,22 @@
 
 /*
  * Time for 64 stereo frames at 48 kHz:
- * 64 / 48000 = 2.666 ms
+ * 64 / 48000 = 1.333 ms
  */
 #define AUDIO_PERIOD_NS     1333333L
 
 // Other defines
-#define NB_THREADS  2
+#define NB_THREADS  3
 #define KEY0_BIT    BIT(0)
 #define KEY1_BIT    BIT(1)
 #define KEY2_BIT    BIT(2)
 #define KEY3_BIT    BIT(3)
 #define BUTTON_SLEEP_TIME 50000 // 50'000us = 50ms
+
+// Watchdog parameters
+#define WATCHDOG_MARGIN_NS  700000L
+#define WATCHDOG_TIMEOUT_NS (AUDIO_PERIOD_NS + WATCHDOG_MARGIN_NS)
+#define AUDIO_DONE_FLAG     BIT(0)
 
 // Stopping Condition
 static volatile sig_atomic_t running = 1;
@@ -64,13 +69,18 @@ static volatile sig_atomic_t running = 1;
 // Audio file descriptor
 static int audio_fd = -1;
 
+// Watchdog flags
+static struct evl_flags watchdog_flags;
+static int watchdog_flags_fd = -1;
+
 static const int mode_size = 4;
 enum Mode {
     NORMAL,
     AMPLITUDE,
     LOW_PASS,
     HIGH_PASS
-} mode = NORMAL;
+};
+static _Atomic enum Mode mode = NORMAL;
 
 /**
  * @brief Stops running after receiving SIGINT
@@ -115,6 +125,18 @@ static void clear_audio(void)
         audio_fd = -1;
     }
 }
+    
+/**
+ * @brief Close watchdog flags
+ */
+static void clear_watchdog(void)
+{
+    if (watchdog_flags_fd >= 0) {
+        evl_close_flags(&watchdog_flags);
+        close(watchdog_flags_fd);
+        watchdog_flags_fd = -1;
+    }
+}
 
 /**
  * @brief Transforms audio depending on filter
@@ -137,6 +159,114 @@ static void process_audio(uint16_t *buffer, size_t samples)
     for (size_t i = 0; i < samples; i++) {
         buffer[i] = buffer[i];
     }
+}
+
+/**
+ * @brief Handles overload detection
+ */
+static void handle_overload(void)
+{
+    /*
+     * For now, nothing is done here.
+     * Later, this function can reduce filter complexity,
+     * switch to bypass mode, or notify the user.
+     */
+}
+
+/**
+ * @brief Adds nanoseconds to a timespec
+ * @param r Result timespec
+ * @param t Initial timespec
+ * @param ns Nanoseconds to add
+ */
+static void timespec_add_ns(struct timespec *r, const struct timespec *t, long long ns)
+{
+    long long s;
+    long long rem;
+
+    s = ns / 1000000000LL;
+    rem = ns - s * 1000000000LL;
+
+    r->tv_sec = t->tv_sec + s;
+    r->tv_nsec = t->tv_nsec + rem;
+
+    if (r->tv_nsec >= 1000000000L) {
+        r->tv_sec++;
+        r->tv_nsec -= 1000000000L;
+    }
+}
+
+/**
+ * Watches audio thread execution time
+ * @param arg arguments received as parameters
+ * @return NULL in any case, check terminal for more information
+ */
+static void *watchdog_audio(void *arg __attribute__((unused)))
+{
+    int ret;
+    int evl_fd;
+    int state;
+    cpu_set_t cpuset;
+    struct timespec now;
+    struct timespec timeout;
+
+    // Set CPU to 1 (RT)
+    CPU_ZERO(&cpuset);
+    CPU_SET(1, &cpuset);
+
+    // Set affinity to cpuset
+    ret = pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (ret != 0) {
+        fprintf(stderr, "watchdog pthread_setaffinity_np() failed: %s\n", strerror(ret));
+        return NULL;
+    }
+
+    // Attach to evl
+    evl_fd = evl_attach_self("watchdog_audio");
+    if (evl_fd < 0) {
+        fprintf(stderr, "watchdog evl_attach_self() failed\n");
+        return NULL;
+    }
+
+    evl_printf("Watchdog EVL thread started\n");
+
+    // Run until stopped
+    while (running) {
+
+        // Read current time
+        ret = evl_read_clock(EVL_CLOCK_MONOTONIC, &now);
+        if (ret != 0) {
+            evl_printf("watchdog evl_read_clock() failed\n");
+            break;
+        }
+
+        // Set watchdog timeout
+        timespec_add_ns(&timeout, &now, WATCHDOG_TIMEOUT_NS);
+
+        // Wait for audio thread end of cycle
+        ret = evl_timedwait_exact_flags(&watchdog_flags, AUDIO_DONE_FLAG, &timeout);
+
+        if (ret == 0) {
+            continue;
+        }
+
+        // Timeout means overload detection
+        evl_peek_flags(&watchdog_flags, &state);
+
+        if (!(state & AUDIO_DONE_FLAG)) {
+            evl_printf("Watchdog: overload detected\n");
+            handle_overload();
+
+            // Clear pending flags for next cycle
+            evl_trywait_flags(&watchdog_flags, &state);
+        }
+    }
+
+    close(evl_fd);
+
+    evl_printf("Watchdog EVL thread stopped\n");
+
+    return NULL;
 }
 
 /**
@@ -223,6 +353,7 @@ static void *copy_audio(void *arg __attribute__((unused)))
 
         // Nothing available
         if (bytes_read == 0) {
+            evl_post_flags(&watchdog_flags, AUDIO_DONE_FLAG);
             continue;
         }
 
@@ -249,6 +380,9 @@ static void *copy_audio(void *arg __attribute__((unused)))
                        bytes_read,
                        bytes_written);
         }
+
+        // Notify watchdog that audio cycle is completed
+        evl_post_flags(&watchdog_flags, AUDIO_DONE_FLAG);
     }
 
     // Stop timer
@@ -329,28 +463,48 @@ int main(void)
         return ret;
     }
 
+    // Create watchdog flags
+    watchdog_flags_fd = evl_new_flags(&watchdog_flags, "audio_watchdog_flags");
+    if (watchdog_flags_fd < 0) {
+        fprintf(stderr, "evl_new_flags() failed\n");
+        goto clear_audio;
+    }
+
     // Create button thread
     ret = pthread_create(&thread[0], NULL, wait_button, NULL);
     if (ret != 0) {
         fprintf(stderr, "Error creating button thread\n");
-        goto clear_audio;
+        goto close_flags;
     }
 
     // Create EVL thread
     ret = pthread_create(&thread[1], NULL, copy_audio, NULL);
     if (ret != 0) {
         fprintf(stderr, "Error creating audio thread\n");
-        goto clear_audio;
+        goto close_flags;
     }
+
+    // Create watchdog thread
+    ret = pthread_create(&thread[2], NULL, watchdog_audio, NULL);
+    if (ret != 0) {
+        fprintf(stderr, "Error creating watchdog thread\n");
+        goto close_flags;
+    }
+
+    // Wake watchdog before joining threads
+    evl_post_flags(&watchdog_flags, AUDIO_DONE_FLAG);
 
     // Wait for threads
     for (int i = 0 ; i < NB_THREADS ; ++i) {
         ret = pthread_join(thread[i], NULL);
         if (ret != 0) {
             fprintf(stderr, "Error joining audio thread\n");
-            goto clear_audio;
+            goto close_flags;
         }
     }
+
+    // Close watchdog flags
+    clear_watchdog();
 
     // Close audio_fd
     clear_audio();
@@ -360,6 +514,9 @@ int main(void)
     return EXIT_SUCCESS;
 
     // Error path
+close_flags:
+    clear_watchdog();
+
 clear_audio:
     clear_audio();
     return ret;
