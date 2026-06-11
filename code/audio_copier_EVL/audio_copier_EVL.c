@@ -79,6 +79,8 @@
 
 // Filter parameters
 #define GAIN        0.5f
+#define LP_ALPHA    0.05f
+#define HP_BETA     0.95f
 #define FIR64_TAPS 64
 #define FIR16_TAPS 16
 
@@ -99,12 +101,22 @@ static int audio_fd = -1;
 
 // Structure for filtering
 typedef struct {
+    // FIR
     float left[FIR64_TAPS];
     float right[FIR64_TAPS];
     size_t index;
-} fir_state_t;
 
-static fir_state_t fir_state = {0};
+    // ELSE
+    float lp_prev_y_left;
+    float lp_prev_y_right;
+
+    float hp_prev_x_left;
+    float hp_prev_x_right;
+    float hp_prev_y_left;
+    float hp_prev_y_right;
+} filter_state_t;
+
+static filter_state_t filter_state = {0};
 
 // Watchdog flags
 static struct evl_flags watchdog_flags;
@@ -117,6 +129,8 @@ static atomic_uint overload_count = 0;
 enum Mode {
     NORMAL,
     AMPLITUDE,
+    LOW_PASS,
+    HIGH_PASS,
     FIR_64,
     FIR_16,
     MODE_COUNT // Number of modes
@@ -330,6 +344,28 @@ static int16_t clamp_i16(float value)
     return (int16_t)value;
 }
 
+static int16_t process_low_pass(int16_t x, float *prev_y)
+{
+    float y;
+
+    y = LP_ALPHA * x + (1.0f - LP_ALPHA) * (*prev_y);
+    *prev_y = y;
+
+    return clamp_i16(y);
+}
+
+static int16_t process_high_pass(int16_t x, float *prev_x, float *prev_y)
+{
+    float y;
+
+    y = HP_BETA * ((*prev_y) + x - (*prev_x));
+
+    *prev_x = x;
+    *prev_y = y;
+
+    return clamp_i16(y);
+}
+
 static int16_t process_fir_sample(float *history,
                                   size_t index,
                                   int16_t x,
@@ -365,19 +401,19 @@ static void process_fir_stereo(int16_t *left, int16_t *right, size_t taps)
         coeffs = fir16_coeffs;
     }
 
-    *left = process_fir_sample(fir_state.left,
-                               fir_state.index,
+    *left = process_fir_sample(filter_state.left,
+                               filter_state.index,
                                *left,
                                coeffs,
                                taps);
 
-    *right = process_fir_sample(fir_state.right,
-                                fir_state.index,
+    *right = process_fir_sample(filter_state.right,
+                                filter_state.index,
                                 *right,
                                 coeffs,
                                 taps);
 
-    fir_state.index = (fir_state.index + 1) % FIR64_TAPS;
+    filter_state.index = (filter_state.index + 1) % FIR64_TAPS;
 }
 
 static int16_t process_amplitude(int16_t x)
@@ -409,6 +445,21 @@ static void process_audio(uint16_t *buffer, size_t samples)
         case AMPLITUDE:
             left = process_amplitude(left);
             right = process_amplitude(right);
+            break;
+
+        case LOW_PASS:
+            left = process_low_pass(left, &filter_state.lp_prev_y_left);
+            right = process_low_pass(right, &filter_state.lp_prev_y_right);
+            break;
+
+        case HIGH_PASS:
+            left = process_high_pass(left,
+                                     &filter_state.hp_prev_x_left,
+                                     &filter_state.hp_prev_y_left);
+
+            right = process_high_pass(right,
+                                      &filter_state.hp_prev_x_right,
+                                      &filter_state.hp_prev_y_right);
             break;
 
         case FIR_64:
